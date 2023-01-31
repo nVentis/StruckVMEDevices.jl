@@ -131,6 +131,27 @@ function readout_task(dev::SIS3316Digitizer; sleep_interval_ns::Integer = 50 * 1
 end
 
 
+function readout_task(dev::SIS3316Digitizer, on_read_cb::Base.Callable; sleep_interval_ns::Integer = 50 * 10^6)
+    Channel{Bool}(0; taskref = nothing, spawn = true) do readout_reqs
+        try
+            @debug "SIS3316Digitizer readout task started"
+            while isopen(dev)
+                if take!(readout_reqs) == true
+                    @info "Sampling starting" 
+                    sampling_loop(dev, readout_reqs, on_read_cb; sleep_interval_ns = sleep_interval_ns)
+                end
+                @info "Sampling stopped"
+            end
+            @debug "SIS3316Digitizer readout task terminating"
+        catch err
+            @error err
+            close(dev)
+        end
+    end
+end
+export readout_task
+
+
 function sampling_loop(dev::SIS3316Digitizer, readout_reqs::Channel{Bool}; sleep_interval_ns::Integer = 50 * 10^6)
     nbuf::Int = 1
     last_check::UInt64 = time_ns()
@@ -163,6 +184,50 @@ function sampling_loop(dev::SIS3316Digitizer, readout_reqs::Channel{Bool}; sleep
                 swap_banks(dev)
                 events = readout_parsed(dev, nbuf, readout_config.channels)
                 dev.events[] = events
+                last_readout = curr_time
+                nbuf += 1
+            end
+            last_check = curr_time
+            nbytes_filled_last .= nbytes_filled
+        end
+    end
+    nothing
+end
+
+
+function sampling_loop(dev::SIS3316Digitizer, readout_reqs::Channel{Bool}, on_read_cb::Base.Callable; sleep_interval_ns::Integer = 50 * 10^6)
+    nbuf::Int = 1
+    last_check::UInt64 = time_ns()
+    last_readout::UInt64 = last_check
+    nbytes_filled_last = fill(0.0, length(all_channels))
+    start_capture(dev)
+
+    active::Bool = true
+    while active && isopen(dev)
+        if isready(readout_reqs) && take!(readout_reqs) == false
+            stop_capture(dev)
+            active = false
+            #!!! TODO: Read out last buffer if necessary
+        else
+            bnkinfo = get_bank_info(dev, all_channels)
+            curr_time = time_ns()
+
+            delta_t_check = (curr_time - last_check) * 1e-9
+            delta_t_readout = (curr_time - last_readout) * 1e-9
+            nbytes_filled = map(x -> Int(x.sampling_nbytes), bnkinfo)
+            evt_nbytes = map(x -> raw_event_data_size(x.event_format), bnkinfo)
+
+            dev.evtrate[] = (nbytes_filled .- nbytes_filled_last) ./ evt_nbytes ./ delta_t_check
+
+            readout_config = dev.readout_config
+            buf_over_thresh = any(nbytes_filled ./ ch_buffer_size .>= readout_config.buf_fill_threshold)
+
+            if buf_over_thresh || delta_t_readout > readout_config.readout_interval
+                @debug "Swapping buffers and reading out"
+                swap_banks(dev)
+                events = readout_parsed(dev, nbuf, readout_config.channels)
+                dev.events[] = events
+                on_read_cb(events)
                 last_readout = curr_time
                 nbuf += 1
             end
@@ -278,7 +343,7 @@ end
 
 
 function get_bank_info(dev::SIS3316Digitizer, channels::AbstractVector{<:Integer} = all_channels)
-    result = fetch.(map(ch -> @mt_async(BankInfo(dev, ch)), all_channels))
+    result = fetch.(map(ch -> @mt_async(BankInfo(dev, ch)), channels))
     convert(Vector{BankInfo}, result)::Vector{BankInfo}
 end
 function get_bank_info end
